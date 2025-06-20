@@ -1,0 +1,13 @@
+{
+  "name": "ollama-weather",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "ts-node weather.ts"
+  },
+  "dependencies": {
+    "node-fetch": "^3.3.2",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.3.3"
+  }
+}
