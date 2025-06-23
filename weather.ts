@@ -1,76 +1,139 @@
 #!/usr/bin/env node
 import fetch from 'node-fetch';
 
-// 1. Configure with your exact model name from `ollama list`
-const OLLAMA_MODEL = "llama3.2:latest"; // ← Must match exactly what you see in `ollama list`
+// Configuration
+const OLLAMA_MODEL = "llama3.2:latest";
+const OLLAMA_HOST = "http://localhost:11434";
+const WEATHER_API_KEY = process.env.OPENWEATHER_API_KEY;
 
-async function getWeatherData(location: string) {
-    const apiKey = process.env.OPENWEATHER_API_KEY;
-    if (!apiKey) throw new Error('Missing OPENWEATHER_API_KEY');
-
-    const response = await fetch(
-        `https://api.openweathermap.org/data/2.5/weather?q=${location}&units=metric&appid=${apiKey}`
-    );
-    
-    if (!response.ok) {
-        throw new Error(`Weather API failed: ${response.statusText}`);
+// System Context Configuration
+const SYSTEM_DIRECTIVES = {
+    identity: "Autonomous Weather Agent",
+    capabilities: [
+        "Determine when weather information is needed",
+        "Automatically fetch weather data when appropriate",
+        "Generate context-aware responses"
+    ],
+    rules: {
+        weather_triggers: [
+            "weather in", "temperature in", "forecast for",
+            "humidity in", "how's the weather", "climate in"
+        ],
+        auto_fetch: true,
+        confirmation_threshold: 0.8
     }
-    
-    const data = await response.json();
-    console.debug("🌐 Raw API Data:", JSON.stringify(data, null, 2)); // Debug log
-    return data;
-}
+};
 
-async function enhanceWithLLM(weather: any) {
-    const prompt = `Create a detailed weather report for ${weather.name} with:
-    - Conditions: ${weather.weather[0].description}
-    - Temperature: ${weather.main.temp}°C
-    - Humidity: ${weather.main.humidity}%
-    - Wind: ${weather.wind?.speed || 'N/A'} km/h
-    Format with emojis and practical advice.`;
-
-    const response = await fetch('http://localhost:11434/api/generate', {
+async function queryModel(prompt: string, context?: string) {
+    const response = await fetch(`${OLLAMA_HOST}/api/generate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-            model: OLLAMA_MODEL, // Using your specific model
-            prompt: prompt,
-            stream: false
+            model: OLLAMA_MODEL,
+            prompt: context ? `${context}\n\n${prompt}` : prompt,
+            stream: false,
+            options: {
+                temperature: 0.3,
+                num_ctx: 8192
+            }
         })
     });
 
-    if (!response.ok) {
-        throw new Error(`Ollama API failed: ${response.statusText}`);
-    }
+    if (!response.ok) throw new Error(`API request failed: ${response.statusText}`);
+    const data = await response.json() as { response: string };
+    return data.response;
+}
 
-    const result = await response.json() as { response?: string };
+type WeatherData = {
+    main: {
+        temp: number;
+        feels_like: number;
+        humidity: number;
+        pressure: number;
+    };
+    weather: { description: string }[];
+    wind: { speed: number };
+};
+
+async function getWeatherData(location: string): Promise<WeatherData> {
+    if (!WEATHER_API_KEY) throw new Error('Weather API key not configured');
     
-    if (!result.response) {
-        throw new Error("Ollama returned empty response");
+    const response = await fetch(
+        `https://api.openweathermap.org/data/2.5/weather?q=${location}&units=metric&appid=${WEATHER_API_KEY}`
+    );
+    
+    if (!response.ok) throw new Error(`Weather API failed: ${response.statusText}`);
+    return await response.json() as WeatherData;
+}
+
+async function shouldFetchWeather(query: string): Promise<{fetch: boolean, location?: string}> {
+    const analysisPrompt = `Analyze this query and determine if weather data is needed:
+    
+    Query: "${query}"
+    
+    Respond ONLY with JSON in this format:
+    {
+        "fetch": boolean,
+        "location": "extracted location or null",
+        "confidence": 0-1
+    }`;
+
+    const response = await queryModel(analysisPrompt, JSON.stringify(SYSTEM_DIRECTIVES));
+    
+    try {
+        const result = JSON.parse(response.trim());
+        return {
+            fetch: result.fetch && result.confidence >= SYSTEM_DIRECTIVES.rules.confirmation_threshold,
+            location: result.location
+        };
+    } catch {
+        return { fetch: false };
     }
+}
+
+async function generateWeatherResponse(location: string) {
+    const weather = await getWeatherData(location);
     
-    return result.response;
+    const weatherContext = `Current weather data for ${location}:
+    - Temperature: ${weather.main.temp}°C (feels like ${weather.main.feels_like}°C)
+    - Conditions: ${weather.weather[0].description}
+    - Humidity: ${weather.main.humidity}%
+    - Wind: ${weather.wind.speed} km/h
+    - Pressure: ${weather.main.pressure} hPa`;
+    
+    return await queryModel(
+        `Generate a friendly weather report using this data: ${weatherContext}`,
+        "You are a weather assistant. Provide clear, concise reports with practical advice."
+    );
+}
+
+async function handleQuery(query: string) {
+    const { fetch, location } = await shouldFetchWeather(query);
+    
+    if (fetch && location) {
+        try {
+            const weatherReport = await generateWeatherResponse(location);
+            console.log("\n🌦️ Weather Report:");
+            console.log(weatherReport);
+        } catch (error) {
+            console.log("\n⚠️ Couldn't fetch weather data. Here's what I know:");
+            console.log(await queryModel(query));
+        }
+    } else {
+        console.log("\n🤖 General Response:");
+        console.log(await queryModel(query));
+    }
 }
 
 async function main() {
-    try {
-        const location = process.argv[2];
-        if (!location) throw new Error("Usage: weather <city>");
-
-        console.log("🌤️  Fetching weather for", location);
-        const weather = await getWeatherData(location);
-        
-        console.log("✨ Enhancing with", OLLAMA_MODEL);
-        const report = await enhanceWithLLM(weather);
-        
-        console.log("\n=== WEATHER REPORT ===");
-        console.log(report);
-        console.log("=====================\n");
-        
-    } catch (error) {
-        console.error("\n❌ Error:", error instanceof Error ? error.message : String(error));
+    const query = process.argv.slice(2).join(" ");
+    if (!query) {
+        console.log("Please provide a query");
         process.exit(1);
     }
+
+    console.log(`🔍 Analyzing: "${query}"`);
+    await handleQuery(query);
 }
 
-main();
+main().catch(console.error);
